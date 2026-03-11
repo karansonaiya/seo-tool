@@ -21,9 +21,10 @@ export function useSEOAudit() {
 
     try {
       // Simulate progress during the API call
+      // PageSpeed Insights API takes 30-60 seconds for a full Lighthouse audit
       const progressInterval = setInterval(() => {
-        setProgress((prev) => Math.min(prev + 5, 85));
-      }, 500);
+        setProgress((prev) => Math.min(prev + 2, 85));
+      }, 1000);
 
       const response = await fetch("/api/audit", {
         method: "POST",

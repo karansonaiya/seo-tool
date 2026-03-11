@@ -674,24 +674,42 @@ async function analyzeTechnical(
   };
 }
 
-/** Analyze performance using PageSpeed Insights API or simulated metrics */
+/**
+ * Analyze performance using Google PageSpeed Insights API.
+ *
+ * IMPORTANT: The PageSpeed Insights API works WITHOUT an API key (rate-limited).
+ * With an API key you get higher quotas. This ensures we always return REAL
+ * Lighthouse-based performance data that matches what users see in Chrome DevTools.
+ *
+ * The old "simulated" approach (timing the HTTP response) was generating
+ * completely inaccurate scores — e.g., 100/100 for a page Lighthouse scores 29.
+ */
 async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
   const issues: SEOIssue[] = [];
-
-  // Try using Google PageSpeed Insights API
   const apiKey = process.env.PAGESPEED_API_KEY;
 
-  if (apiKey) {
-    try {
-      const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&key=${apiKey}&strategy=mobile&category=performance`;
-      const response = await axios.get(apiUrl, { timeout: 60000 });
-      const data = response.data;
-      const lighthouse = data.lighthouseResult;
+  // --------------------------------------------------
+  // Step 1: Always try Google PageSpeed Insights API
+  //         It works without an API key (just rate-limited)
+  // --------------------------------------------------
+  try {
+    let apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&category=performance`;
+    if (apiKey) {
+      apiUrl += `&key=${apiKey}`;
+    }
 
+    console.log(`[PageSpeed] Fetching real Lighthouse data for: ${url}`);
+    const response = await axios.get(apiUrl, { timeout: 90000 });
+    const data = response.data;
+    const lighthouse = data.lighthouseResult;
+
+    if (lighthouse && lighthouse.categories && lighthouse.categories.performance) {
       const score = Math.round((lighthouse.categories.performance.score || 0) * 100);
-      const audits = lighthouse.audits;
+      const audits = lighthouse.audits || {};
 
-      return {
+      console.log(`[PageSpeed] Real Lighthouse performance score: ${score}/100`);
+
+      const result: PerformanceAnalysis = {
         score,
         lcp: extractMetric(audits["largest-contentful-paint"], "ms"),
         cls: extractMetric(audits["cumulative-layout-shift"], ""),
@@ -700,50 +718,125 @@ async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
         ttfb: extractMetric(audits["server-response-time"], "ms"),
         speedIndex: extractMetric(audits["speed-index"], "ms"),
         totalBlockingTime: extractMetric(audits["total-blocking-time"], "ms"),
-        pageSize: 0,
-        requestCount: 0,
+        pageSize: audits["total-byte-weight"]?.numericValue || 0,
+        requestCount: audits["network-requests"]?.details?.items?.length || 0,
         unusedCss: audits["unused-css-rules"]?.details?.overallSavingsBytes || 0,
         unusedJs: audits["unused-javascript"]?.details?.overallSavingsBytes || 0,
         renderBlockingResources:
           audits["render-blocking-resources"]?.details?.items?.length || 0,
-        issues: generatePerformanceIssues(score, issues),
+        issues: [],
       };
-    } catch {
-      // Fall through to simulated analysis
+
+      result.issues = generatePerformanceIssues(score, issues);
+      return result;
     }
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.warn(`[PageSpeed] API call failed: ${errMsg}. Using HTML-based estimation.`);
   }
 
-  // Simulated performance analysis (when no API key available)
-  // Measures actual response time as a rough proxy
+  // --------------------------------------------------
+  // Step 2: Fallback — HTML-based estimation
+  //         Used ONLY when PageSpeed API is unreachable.
+  //         Estimates conservatively by analyzing HTML content
+  //         rather than generating optimistic fake numbers.
+  // --------------------------------------------------
+  console.log(`[PageSpeed] Falling back to HTML-based performance estimation for: ${url}`);
+
+  let responseTime = 5000; // default to poor if we can't fetch
+  let htmlSize = 0;
+  let scriptCount = 0;
+  let stylesheetCount = 0;
+  let totalImgCount = 0;
+
   const startTime = Date.now();
   try {
-    await axios.get(url, { timeout: 30000 });
-  } catch {
-    // Ignore fetch errors
-  }
-  const responseTime = Date.now() - startTime;
+    const resp = await axios.get(url, {
+      timeout: 30000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (compatible; SEOAutoFix/1.0; +https://seoautofix.com/bot)",
+      },
+    });
+    responseTime = Date.now() - startTime;
+    const html = typeof resp.data === "string" ? resp.data : "";
+    htmlSize = Buffer.byteLength(html, "utf8");
 
-  // Generate approximate scores based on response time
-  const score = Math.max(0, Math.min(100, Math.round(100 - (responseTime / 100))));
+    // Count render-blocking resources from the HTML
+    const $ = cheerio.load(html);
+    scriptCount = $("script[src]").length;
+    stylesheetCount = $('link[rel="stylesheet"]').length;
+    totalImgCount = $("img").length;
+  } catch {
+    responseTime = Date.now() - startTime;
+  }
+
+  // ------- Conservative Score Estimation -------
+  // Start from 50 (moderate) and adjust up/down based on signals.
+  // This prevents the old bug of "fast server = 100 score".
+  let estimatedScore = 50;
+
+  // TTFB penalty/bonus (server response)
+  if (responseTime < 200) estimatedScore += 10;
+  else if (responseTime < 600) estimatedScore += 5;
+  else if (responseTime > 3000) estimatedScore -= 20;
+  else if (responseTime > 1500) estimatedScore -= 10;
+
+  // Large HTML penalty
+  if (htmlSize > 500000) estimatedScore -= 15;
+  else if (htmlSize > 200000) estimatedScore -= 8;
+  else if (htmlSize < 50000) estimatedScore += 5;
+
+  // Too many scripts penalty (render-blocking)
+  if (scriptCount > 20) estimatedScore -= 15;
+  else if (scriptCount > 10) estimatedScore -= 8;
+  else if (scriptCount > 5) estimatedScore -= 3;
+
+  // Too many stylesheets
+  if (stylesheetCount > 10) estimatedScore -= 8;
+  else if (stylesheetCount > 5) estimatedScore -= 3;
+
+  // Too many images
+  if (totalImgCount > 30) estimatedScore -= 5;
+
+  estimatedScore = Math.max(0, Math.min(100, estimatedScore));
+
+  // Estimate metrics conservatively (multiply response time by larger factors
+  // because actual page rendering is always slower than server response)
+  const estimatedFcp = responseTime * 3;
+  const estimatedLcp = responseTime * 6;
+  const estimatedTbt = scriptCount * 150;
+  const estimatedSi = responseTime * 5;
 
   const performanceResult: PerformanceAnalysis = {
-    score,
-    lcp: createMetric(responseTime * 1.5, "ms", PERFORMANCE_THRESHOLDS.LCP),
+    score: estimatedScore,
+    lcp: createMetric(estimatedLcp, "ms", PERFORMANCE_THRESHOLDS.LCP),
     cls: createMetric(0.1, "", { good: 0.1, poor: 0.25 }),
-    fid: createMetric(responseTime * 0.3, "ms", PERFORMANCE_THRESHOLDS.FID),
-    fcp: createMetric(responseTime * 0.8, "ms", PERFORMANCE_THRESHOLDS.FCP),
+    fid: createMetric(estimatedTbt * 0.5, "ms", PERFORMANCE_THRESHOLDS.FID),
+    fcp: createMetric(estimatedFcp, "ms", PERFORMANCE_THRESHOLDS.FCP),
     ttfb: createMetric(responseTime, "ms", PERFORMANCE_THRESHOLDS.TTFB),
-    speedIndex: createMetric(responseTime * 2, "ms", PERFORMANCE_THRESHOLDS.SPEED_INDEX),
-    totalBlockingTime: createMetric(responseTime * 0.5, "ms", PERFORMANCE_THRESHOLDS.TBT),
-    pageSize: 0,
-    requestCount: 0,
+    speedIndex: createMetric(estimatedSi, "ms", PERFORMANCE_THRESHOLDS.SPEED_INDEX),
+    totalBlockingTime: createMetric(estimatedTbt, "ms", PERFORMANCE_THRESHOLDS.TBT),
+    pageSize: htmlSize,
+    requestCount: scriptCount + stylesheetCount + totalImgCount,
     unusedCss: 0,
     unusedJs: 0,
-    renderBlockingResources: 0,
+    renderBlockingResources: scriptCount + stylesheetCount,
     issues: [],
   };
 
-  performanceResult.issues = generatePerformanceIssues(score, issues);
+  // Add a notice that these are estimated values
+  performanceResult.issues.push({
+    id: "estimated-performance",
+    title: "Estimated Performance Metrics",
+    description:
+      "Performance metrics were estimated from HTML analysis because the Google PageSpeed API was unavailable. For accurate Lighthouse scores, ensure internet connectivity or set PAGESPEED_API_KEY.",
+    severity: "info",
+    category: "performance",
+    fix: "Set the PAGESPEED_API_KEY environment variable for precise Lighthouse-based scoring.",
+  });
+
+  performanceResult.issues = generatePerformanceIssues(estimatedScore, performanceResult.issues);
   return performanceResult;
 }
 
@@ -778,11 +871,20 @@ function createMetric(
       : value <= thresholds.poor
         ? "needs-improvement"
         : "poor";
+
+  // Format display value — CLS and other unitless metrics need decimal precision
+  let displayValue: string;
+  if (!unit) {
+    displayValue = (Math.round(value * 1000) / 1000).toString();
+  } else {
+    displayValue = `${Math.round(value)}${unit}`;
+  }
+
   return {
-    value: Math.round(value * 100) / 100,
+    value: Math.round(value * 1000) / 1000,
     unit,
     rating: rating as "good" | "needs-improvement" | "poor",
-    displayValue: `${Math.round(value)}${unit}`,
+    displayValue,
   };
 }
 
