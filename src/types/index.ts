@@ -129,6 +129,7 @@ export interface TechnicalAnalysis {
 /** Performance analysis results (Lighthouse-like) */
 export interface PerformanceAnalysis {
   score: number;
+  desktopScore?: number;
   lcp: MetricResult;
   cls: MetricResult;
   fid: MetricResult;

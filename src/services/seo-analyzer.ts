@@ -10,7 +10,7 @@ import {
   PerformanceAnalysis,
   SEOIssue,
 } from "@/types";
-import { META_TAG_LIMITS, PERFORMANCE_THRESHOLDS, IMAGE_LIMITS } from "@/constants";
+import { META_TAG_LIMITS, PERFORMANCE_THRESHOLDS } from "@/constants";
 
 // ===========================================
 // SEO Analysis Engine
@@ -31,7 +31,7 @@ export async function analyzeSEO(url: string): Promise<SEOAuditResult> {
   // Run all analysis modules in parallel
   const [metaTags, headings, links, images, technical, performance] = await Promise.all([
     analyzeMetaTags($, normalizedUrl),
-    analyzeHeadings($),
+    analyzeHeadings($, normalizedUrl),
     analyzeLinks($, normalizedUrl),
     analyzeImages($, normalizedUrl),
     analyzeTechnical($, normalizedUrl),
@@ -52,8 +52,9 @@ export async function analyzeSEO(url: string): Promise<SEOAuditResult> {
   const technicalScore = calculateTechnicalScore(technical, metaTags);
   const performanceScore = performance.score;
   const contentScore = calculateContentScore(headings, metaTags, images);
+  // Weighted: performance matters most (real Lighthouse score), then technical, then content
   const overallScore = Math.round(
-    technicalScore * 0.35 + performanceScore * 0.35 + contentScore * 0.3
+    performanceScore * 0.40 + technicalScore * 0.35 + contentScore * 0.25
   );
 
   return {
@@ -80,17 +81,59 @@ async function fetchPage(url: string): Promise<string> {
       timeout: 30000,
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (compatible; SEOAutoFix/1.0; +https://seoautofix.com/bot)",
-        Accept: "text/html,application/xhtml+xml",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
       },
       maxRedirects: 5,
-      validateStatus: (status) => status < 400,
+      validateStatus: (status) => status < 500,
     });
+
+    if (response.status === 403) {
+      throw new Error(
+        `Access denied (403): The website "${url}" is blocking automated requests. Try a different URL or check if the site is publicly accessible.`
+      );
+    }
+
+    if (response.status === 404) {
+      throw new Error(`Page not found (404): The URL "${url}" does not exist.`);
+    }
+
+    if (response.status >= 400) {
+      throw new Error(
+        `HTTP error ${response.status}: Unable to access "${url}".`
+      );
+    }
+
     return response.data;
   } catch (error: unknown) {
     if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      if (status === 403) {
+        throw new Error(
+          `Access denied (403): The website is blocking automated requests. This site may require login or disallow crawlers.`
+        );
+      }
+      if (status === 404) {
+        throw new Error(`Page not found (404): The URL does not exist.`);
+      }
+      if (error.code === "ECONNREFUSED") {
+        throw new Error(`Connection refused: Could not connect to "${url}".`);
+      }
+      if (error.code === "ETIMEDOUT" || error.code === "ECONNABORTED") {
+        throw new Error(`Request timed out: "${url}" took too long to respond.`);
+      }
       throw new Error(`Failed to fetch page: ${error.message}`);
     }
+    if (error instanceof Error) throw error;
     throw new Error("Failed to fetch page");
   }
 }
@@ -106,7 +149,7 @@ function normalizeUrl(url: string): string {
 /** Extract and analyze meta tags from HTML */
 async function analyzeMetaTags(
   $: cheerio.CheerioAPI,
-  url: string
+  pageUrl: string
 ): Promise<MetaTagAnalysis> {
   const issues: SEOIssue[] = [];
 
@@ -234,6 +277,26 @@ async function analyzeMetaTags(
     });
   }
 
+  // Check canonical URL mismatch — if canonical points to a different page, flag it
+  if (canonical) {
+    try {
+      const canonicalNorm = new URL(canonical, pageUrl).href.replace(/\/$/, "");
+      const pageNorm = pageUrl.replace(/\/$/, "");
+      if (canonicalNorm !== pageNorm) {
+        issues.push({
+          id: "canonical-mismatch",
+          title: "Canonical Points to Different URL",
+          description: `The canonical tag points to "${canonical}", which differs from the current page URL. This may cause indexing of the wrong page.`,
+          severity: "warning",
+          category: "meta",
+          fix: "Verify the canonical URL is intentional. It should match the preferred version of this page.",
+        });
+      }
+    } catch {
+      // invalid canonical URL
+    }
+  }
+
   return {
     title,
     titleLength,
@@ -254,8 +317,11 @@ async function analyzeMetaTags(
   };
 }
 
-/** Analyze heading hierarchy */
-async function analyzeHeadings($: cheerio.CheerioAPI): Promise<HeadingAnalysis> {
+/** Analyze heading hierarchy, word count, and content quality */
+async function analyzeHeadings(
+  $: cheerio.CheerioAPI,
+  url: string
+): Promise<HeadingAnalysis> {
   const issues: SEOIssue[] = [];
   const h1Tags: string[] = [];
 
@@ -277,6 +343,70 @@ async function analyzeHeadings($: cheerio.CheerioAPI): Promise<HeadingAnalysis> 
     const level = parseInt(tag.replace("h", ""), 10);
     hierarchy.push({ level, text: $(el).text().trim() });
   });
+
+  // --- Word count / thin content check ---
+  // Remove script, style, nav, header, footer noise before counting
+  const bodyClone = $.root().clone();
+  bodyClone.find("script, style, nav, header, footer, aside, noscript").remove();
+  const visibleText = bodyClone.text().replace(/\s+/g, " ").trim();
+  const wordCount = visibleText
+    .split(/\s+/)
+    .filter((w) => w.length > 1).length;
+
+  if (wordCount < 300 && wordCount > 0) {
+    issues.push({
+      id: "thin-content",
+      title: "Thin Content",
+      description: `Page has only ~${wordCount} words. Search engines prefer pages with substantial content (300+ words).`,
+      severity: wordCount < 100 ? "critical" : "warning",
+      category: "content",
+      fix: "Add more meaningful content. Aim for at least 300–500 words on important pages.",
+    });
+  }
+
+  // --- H1 keyword alignment with page title ---
+  const pageTitle = $("title").text().trim().toLowerCase();
+  const h1Text = h1Tags[0]?.toLowerCase() || "";
+  if (h1Text && pageTitle) {
+    const h1Words = h1Text.split(/\s+/).filter((w) => w.length > 3);
+    const titleHasH1Keyword = h1Words.some((w) => pageTitle.includes(w));
+    if (!titleHasH1Keyword) {
+      issues.push({
+        id: "h1-title-mismatch",
+        title: "H1 and Title Tag Not Aligned",
+        description:
+          "The H1 heading and the page title share no common keywords. Aligning them signals topic relevance to search engines.",
+        severity: "info",
+        category: "content",
+        fix: "Ensure your H1 and title tag share the primary keyword.",
+      });
+    }
+  }
+
+  // --- URL keyword in H1 ---
+  try {
+    const urlPath = new URL(url).pathname
+      .replace(/[-_/]/g, " ")
+      .toLowerCase()
+      .trim();
+    if (urlPath && h1Text && urlPath !== "/") {
+      const urlWords = urlPath.split(/\s+/).filter((w) => w.length > 3);
+      const h1HasUrlKeyword = urlWords.some((w) => h1Text.includes(w));
+      if (!h1HasUrlKeyword && urlWords.length > 0) {
+        issues.push({
+          id: "h1-url-mismatch",
+          title: "H1 Doesn't Reflect URL Keywords",
+          description:
+            "The URL path contains keywords not found in the H1 heading. Matching them improves topical relevance.",
+          severity: "info",
+          category: "content",
+          fix: "Include your main URL keyword in the H1 heading.",
+        });
+      }
+    }
+  } catch {
+    // invalid URL
+  }
 
   if (h1Count === 0) {
     issues.push({
@@ -359,37 +489,85 @@ async function analyzeLinks(
     }
   });
 
-  // Check a sample of links for broken status (limit to 20 to avoid rate limiting)
-  const linksToCheck = allLinks.slice(0, 20);
-  for (const link of linksToCheck) {
+  // Check a sample of external links for broken status (limit to 15 to avoid rate limiting)
+  // Skip internal links (same domain) and non-HTTP links to reduce false positives
+  const externalLinksToCheck = allLinks
+    .filter(({ href }) => {
+      if (!href) return false;
+      // Skip anchors, mailto, tel, javascript, data URIs
+      if (
+        href.startsWith("#") ||
+        href.startsWith("mailto:") ||
+        href.startsWith("tel:") ||
+        href.startsWith("javascript:") ||
+        href.startsWith("data:")
+      )
+        return false;
+      try {
+        const u = new URL(href, baseUrl);
+        // Only check absolute external URLs
+        return (
+          (u.protocol === "http:" || u.protocol === "https:") &&
+          u.hostname !== baseUrlObj.hostname
+        );
+      } catch {
+        return false;
+      }
+    })
+    .slice(0, 15);
+
+  for (const link of externalLinksToCheck) {
     try {
       const fullUrl = new URL(link.href, baseUrl).toString();
-      const response = await axios.head(fullUrl, {
-        timeout: 10000,
-        maxRedirects: 0,
-        validateStatus: () => true,
-      });
+      let status = 0;
 
-      if (response.status >= 400) {
+      try {
+        // Try HEAD first (faster)
+        const headRes = await axios.head(fullUrl, {
+          timeout: 8000,
+          maxRedirects: 3,
+          validateStatus: () => true,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          },
+        });
+        status = headRes.status;
+
+        // 405 = Method Not Allowed (HEAD not supported) — not broken, skip
+        // 403 = server blocks HEAD checks — do not count as broken
+        if (status === 405 || status === 403) continue;
+      } catch {
+        // HEAD failed completely — try GET with small range
+        try {
+          const getRes = await axios.get(fullUrl, {
+            timeout: 8000,
+            maxRedirects: 3,
+            validateStatus: () => true,
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+              Range: "bytes=0-0",
+            },
+          });
+          status = getRes.status;
+        } catch {
+          // Connection truly failed
+          status = 0;
+        }
+      }
+
+      // Only flag 404 and 410 as definitively broken (avoid false positives from 5xx, auth, etc.)
+      if (status === 404 || status === 410) {
         brokenLinks.push({
           url: fullUrl,
-          statusCode: response.status,
+          statusCode: status,
           anchorText: link.text,
           location: "page",
         });
       }
     } catch {
-      // Connection failed - likely broken
-      try {
-        brokenLinks.push({
-          url: new URL(link.href, baseUrl).toString(),
-          statusCode: 0,
-          anchorText: link.text,
-          location: "page",
-        });
-      } catch {
-        // Invalid URL, skip
-      }
+      // Invalid URL, skip
     }
   }
 
@@ -441,8 +619,15 @@ async function analyzeImages(
 
   $("img").each((_, el) => {
     totalImages++;
-    const src = $(el).attr("src") || "";
-    const alt = $(el).attr("alt") || null;
+    const rawSrc = $(el).attr("src") || $(el).attr("data-src") || "";
+    // Resolve relative URLs to absolute for consistent analysis
+    let src = rawSrc;
+    try {
+      src = rawSrc ? new URL(rawSrc, baseUrl).href : rawSrc;
+    } catch {
+      src = rawSrc;
+    }
+    const alt = $(el).attr("alt") ?? null;
     const width = $(el).attr("width") ? parseInt($(el).attr("width")!, 10) : null;
     const height = $(el).attr("height") ? parseInt($(el).attr("height")!, 10) : null;
     const loading = $(el).attr("loading");
@@ -454,7 +639,7 @@ async function analyzeImages(
       width,
       height,
       fileSize: null,
-      format: src.split(".").pop()?.split("?")[0] || null,
+      format: rawSrc.split(".").pop()?.split("?")[0]?.toLowerCase() || null,
       hasLazyLoading,
     };
 
@@ -529,41 +714,93 @@ async function analyzeTechnical(
   let hasRobotsTxt = false;
   let robotsTxtContent: string | null = null;
   try {
-    const robotsResponse = await axios.get(`${origin}/robots.txt`, { timeout: 10000 });
+    const robotsResponse = await axios.get(`${origin}/robots.txt`, {
+      timeout: 10000,
+      validateStatus: (s) => s === 200,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      },
+    });
     if (robotsResponse.status === 200) {
       hasRobotsTxt = true;
-      robotsTxtContent = robotsResponse.data;
+      robotsTxtContent =
+        typeof robotsResponse.data === "string" ? robotsResponse.data : null;
     }
   } catch {
     // robots.txt not found
   }
 
-  // Check for sitemap
+  // Check for sitemap — try multiple strategies:
+  // 1. Parse Sitemap: directive from robots.txt
+  // 2. /sitemap.xml
+  // 3. /sitemap_index.xml
   let hasSitemap = false;
   let sitemapUrl: string | null = null;
-  try {
-    const sitemapResponse = await axios.get(`${origin}/sitemap.xml`, {
-      timeout: 10000,
-      validateStatus: (s) => s === 200,
-    });
-    if (sitemapResponse.status === 200) {
+
+  // Strategy 1: Parse robots.txt for Sitemap directive
+  if (robotsTxtContent) {
+    const sitemapMatch = robotsTxtContent.match(/^Sitemap:\s*(.+)$/im);
+    if (sitemapMatch) {
+      sitemapUrl = sitemapMatch[1].trim();
       hasSitemap = true;
-      sitemapUrl = `${origin}/sitemap.xml`;
     }
-  } catch {
-    // sitemap not found
+  }
+
+  // Strategy 2+3: Try common sitemap paths
+  if (!hasSitemap) {
+    const sitemapPaths = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml"];
+    for (const path of sitemapPaths) {
+      try {
+        const sitemapResponse = await axios.get(`${origin}${path}`, {
+          timeout: 8000,
+          validateStatus: (s) => s === 200,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          },
+        });
+        if (sitemapResponse.status === 200) {
+          hasSitemap = true;
+          sitemapUrl = `${origin}${path}`;
+          break;
+        }
+      } catch {
+        // try next path
+      }
+    }
   }
 
   // Check canonical
   const canonical = $('link[rel="canonical"]').attr("href") || null;
   const hasCanonical = !!canonical;
 
-  // Check Schema markup
+  // Check Schema markup — handle single objects, @graph arrays, and root arrays
   const schemaTypes: string[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
     try {
-      const data = JSON.parse($(el).html() || "{}");
-      if (data["@type"]) schemaTypes.push(data["@type"]);
+      const raw = $(el).html() || "{}";
+      const data = JSON.parse(raw);
+
+      const extractTypes = (obj: unknown): void => {
+        if (!obj || typeof obj !== "object") return;
+        if (Array.isArray(obj)) {
+          obj.forEach(extractTypes);
+          return;
+        }
+        const record = obj as Record<string, unknown>;
+        if (record["@type"]) {
+          const t = record["@type"];
+          if (Array.isArray(t)) t.forEach((v) => schemaTypes.push(String(v)));
+          else schemaTypes.push(String(t));
+        }
+        // Handle @graph
+        if (Array.isArray(record["@graph"])) {
+          (record["@graph"] as unknown[]).forEach(extractTypes);
+        }
+      };
+
+      extractTypes(data);
     } catch {
       // Invalid JSON-LD
     }
@@ -674,43 +911,162 @@ async function analyzeTechnical(
   };
 }
 
+const CHROME_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+
 /**
- * Analyze performance using Google PageSpeed Insights API.
- *
- * IMPORTANT: The PageSpeed Insights API works WITHOUT an API key (rate-limited).
- * With an API key you get higher quotas. This ensures we always return REAL
- * Lighthouse-based performance data that matches what users see in Chrome DevTools.
- *
- * The old "simulated" approach (timing the HTTP response) was generating
- * completely inaccurate scores — e.g., 100/100 for a page Lighthouse scores 29.
+ * Analyze performance using Google PageSpeed Insights API (mobile + desktop).
+ * Works without an API key (rate-limited). With PAGESPEED_API_KEY env var, gets higher quotas.
  */
 async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
-  const issues: SEOIssue[] = [];
   const apiKey = process.env.PAGESPEED_API_KEY;
 
+  const buildApiUrl = (strategy: "mobile" | "desktop") => {
+    let u = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=${strategy}&category=performance&category=seo&category=best-practices`;
+    if (apiKey) u += `&key=${apiKey}`;
+    return u;
+  };
+
   // --------------------------------------------------
-  // Step 1: Always try Google PageSpeed Insights API
-  //         It works without an API key (just rate-limited)
+  // Step 1: Fetch mobile + desktop PageSpeed in parallel
   // --------------------------------------------------
   try {
-    let apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&category=performance`;
-    if (apiKey) {
-      apiUrl += `&key=${apiKey}`;
-    }
+    console.log(`[PageSpeed] Fetching mobile + desktop Lighthouse data for: ${url}`);
 
-    console.log(`[PageSpeed] Fetching real Lighthouse data for: ${url}`);
-    const response = await axios.get(apiUrl, { timeout: 90000 });
-    const data = response.data;
-    const lighthouse = data.lighthouseResult;
+    const [mobileRes, desktopRes] = await Promise.allSettled([
+      axios.get(buildApiUrl("mobile"), { timeout: 90000 }),
+      axios.get(buildApiUrl("desktop"), { timeout: 90000 }),
+    ]);
 
-    if (lighthouse && lighthouse.categories && lighthouse.categories.performance) {
-      const score = Math.round((lighthouse.categories.performance.score || 0) * 100);
-      const audits = lighthouse.audits || {};
+    const mobileLH =
+      mobileRes.status === "fulfilled"
+        ? mobileRes.value.data?.lighthouseResult
+        : null;
+    const desktopLH =
+      desktopRes.status === "fulfilled"
+        ? desktopRes.value.data?.lighthouseResult
+        : null;
 
-      console.log(`[PageSpeed] Real Lighthouse performance score: ${score}/100`);
+    if (mobileLH?.categories?.performance) {
+      const mobileScore = Math.round((mobileLH.categories.performance.score || 0) * 100);
+      const desktopScore =
+        desktopLH?.categories?.performance
+          ? Math.round((desktopLH.categories.performance.score || 0) * 100)
+          : undefined;
+
+      console.log(
+        `[PageSpeed] Mobile: ${mobileScore}/100  Desktop: ${desktopScore ?? "N/A"}/100`
+      );
+
+      const audits = mobileLH.audits || {};
+      const issues: SEOIssue[] = [];
+
+      // Extract specific failing Lighthouse audits as actionable SEO issues
+      const auditChecks: Array<{
+        id: string;
+        issueId: string;
+        title: string;
+        severity: SEOIssue["severity"];
+        fix: string;
+      }> = [
+        {
+          id: "render-blocking-resources",
+          issueId: "render-blocking",
+          title: "Render-Blocking Resources",
+          severity: "warning",
+          fix: "Eliminate render-blocking CSS/JS by deferring or inlining critical resources.",
+        },
+        {
+          id: "unused-css-rules",
+          issueId: "unused-css",
+          title: "Unused CSS",
+          severity: "warning",
+          fix: "Remove unused CSS rules to reduce payload and improve parse time.",
+        },
+        {
+          id: "unused-javascript",
+          issueId: "unused-js",
+          title: "Unused JavaScript",
+          severity: "warning",
+          fix: "Remove unused JS or use code-splitting to reduce bundle size.",
+        },
+        {
+          id: "uses-optimized-images",
+          issueId: "unoptimized-images",
+          title: "Unoptimized Images",
+          severity: "warning",
+          fix: "Compress and resize images to reduce page weight.",
+        },
+        {
+          id: "uses-text-compression",
+          issueId: "no-text-compression",
+          title: "Text Compression Not Enabled",
+          severity: "warning",
+          fix: "Enable gzip or Brotli compression on your server.",
+        },
+        {
+          id: "uses-long-cache-ttl",
+          issueId: "short-cache-ttl",
+          title: "Short Cache TTL",
+          severity: "info",
+          fix: "Set long cache TTLs for static assets (CSS, JS, images).",
+        },
+        {
+          id: "server-response-time",
+          issueId: "slow-ttfb",
+          title: "Slow Server Response Time (TTFB)",
+          severity: "warning",
+          fix: "Optimize server response: use CDN, caching, or upgrade hosting.",
+        },
+        {
+          id: "largest-contentful-paint-element",
+          issueId: "slow-lcp",
+          title: "Slow Largest Contentful Paint (LCP)",
+          severity: "critical",
+          fix: "Optimize the largest visible element (hero image or heading) to load faster.",
+        },
+        {
+          id: "total-blocking-time",
+          issueId: "high-tbt",
+          title: "High Total Blocking Time (TBT)",
+          severity: "warning",
+          fix: "Reduce long JS tasks and minimize main thread blocking.",
+        },
+        {
+          id: "cumulative-layout-shift",
+          issueId: "high-cls",
+          title: "High Cumulative Layout Shift (CLS)",
+          severity: "warning",
+          fix: "Set explicit width/height on images and avoid injecting content above existing content.",
+        },
+      ];
+
+      for (const check of auditChecks) {
+        const audit = audits[check.id];
+        if (!audit) continue;
+        // Only add issue if audit score is not passing (< 0.9) and has savings
+        const auditScore = audit.score ?? 1;
+        const hasSavings =
+          (audit.details?.overallSavingsMs ?? audit.details?.overallSavingsBytes ?? 0) > 0 ||
+          (audit.numericValue ?? 0) > 0;
+        if (auditScore < 0.9 && hasSavings) {
+          issues.push({
+            id: check.issueId,
+            title: check.title,
+            description:
+              audit.displayValue
+                ? `${audit.title}: ${audit.displayValue}`
+                : audit.description || check.title,
+            severity: check.severity,
+            category: "performance",
+            fix: check.fix,
+          });
+        }
+      }
 
       const result: PerformanceAnalysis = {
-        score,
+        score: mobileScore,
+        desktopScore,
         lcp: extractMetric(audits["largest-contentful-paint"], "ms"),
         cls: extractMetric(audits["cumulative-layout-shift"], ""),
         fid: extractMetric(audits["max-potential-fid"], "ms"),
@@ -724,10 +1080,10 @@ async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
         unusedJs: audits["unused-javascript"]?.details?.overallSavingsBytes || 0,
         renderBlockingResources:
           audits["render-blocking-resources"]?.details?.items?.length || 0,
-        issues: [],
+        issues,
       };
 
-      result.issues = generatePerformanceIssues(score, issues);
+      result.issues = generatePerformanceIssues(mobileScore, result.issues);
       return result;
     }
   } catch (error: unknown) {
@@ -738,12 +1094,10 @@ async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
   // --------------------------------------------------
   // Step 2: Fallback — HTML-based estimation
   //         Used ONLY when PageSpeed API is unreachable.
-  //         Estimates conservatively by analyzing HTML content
-  //         rather than generating optimistic fake numbers.
   // --------------------------------------------------
-  console.log(`[PageSpeed] Falling back to HTML-based performance estimation for: ${url}`);
+  console.log(`[PageSpeed] Falling back to HTML-based estimation for: ${url}`);
 
-  let responseTime = 5000; // default to poor if we can't fetch
+  let responseTime = 5000;
   let htmlSize = 0;
   let scriptCount = 0;
   let stylesheetCount = 0;
@@ -753,60 +1107,52 @@ async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
   try {
     const resp = await axios.get(url, {
       timeout: 30000,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (compatible; SEOAutoFix/1.0; +https://seoautofix.com/bot)",
-      },
+      headers: { "User-Agent": CHROME_UA },
     });
     responseTime = Date.now() - startTime;
     const html = typeof resp.data === "string" ? resp.data : "";
     htmlSize = Buffer.byteLength(html, "utf8");
 
-    // Count render-blocking resources from the HTML
-    const $ = cheerio.load(html);
-    scriptCount = $("script[src]").length;
-    stylesheetCount = $('link[rel="stylesheet"]').length;
-    totalImgCount = $("img").length;
+    const $fb = cheerio.load(html);
+    scriptCount = $fb("script[src]").length;
+    stylesheetCount = $fb('link[rel="stylesheet"]').length;
+    totalImgCount = $fb("img").length;
   } catch {
     responseTime = Date.now() - startTime;
   }
 
-  // ------- Conservative Score Estimation -------
-  // Start from 50 (moderate) and adjust up/down based on signals.
-  // This prevents the old bug of "fast server = 100 score".
   let estimatedScore = 50;
-
-  // TTFB penalty/bonus (server response)
   if (responseTime < 200) estimatedScore += 10;
   else if (responseTime < 600) estimatedScore += 5;
   else if (responseTime > 3000) estimatedScore -= 20;
   else if (responseTime > 1500) estimatedScore -= 10;
-
-  // Large HTML penalty
   if (htmlSize > 500000) estimatedScore -= 15;
   else if (htmlSize > 200000) estimatedScore -= 8;
   else if (htmlSize < 50000) estimatedScore += 5;
-
-  // Too many scripts penalty (render-blocking)
   if (scriptCount > 20) estimatedScore -= 15;
   else if (scriptCount > 10) estimatedScore -= 8;
   else if (scriptCount > 5) estimatedScore -= 3;
-
-  // Too many stylesheets
   if (stylesheetCount > 10) estimatedScore -= 8;
   else if (stylesheetCount > 5) estimatedScore -= 3;
-
-  // Too many images
   if (totalImgCount > 30) estimatedScore -= 5;
-
   estimatedScore = Math.max(0, Math.min(100, estimatedScore));
 
-  // Estimate metrics conservatively (multiply response time by larger factors
-  // because actual page rendering is always slower than server response)
   const estimatedFcp = responseTime * 3;
   const estimatedLcp = responseTime * 6;
   const estimatedTbt = scriptCount * 150;
   const estimatedSi = responseTime * 5;
+
+  const fallbackIssues: SEOIssue[] = [
+    {
+      id: "estimated-performance",
+      title: "Estimated Performance Metrics",
+      description:
+        "Performance metrics were estimated from HTML analysis because the Google PageSpeed API was unavailable. For accurate Lighthouse scores, set PAGESPEED_API_KEY in your environment.",
+      severity: "info",
+      category: "performance",
+      fix: "Set the PAGESPEED_API_KEY environment variable for precise Lighthouse-based scoring.",
+    },
+  ];
 
   const performanceResult: PerformanceAnalysis = {
     score: estimatedScore,
@@ -822,21 +1168,9 @@ async function analyzePerformance(url: string): Promise<PerformanceAnalysis> {
     unusedCss: 0,
     unusedJs: 0,
     renderBlockingResources: scriptCount + stylesheetCount,
-    issues: [],
+    issues: generatePerformanceIssues(estimatedScore, fallbackIssues),
   };
 
-  // Add a notice that these are estimated values
-  performanceResult.issues.push({
-    id: "estimated-performance",
-    title: "Estimated Performance Metrics",
-    description:
-      "Performance metrics were estimated from HTML analysis because the Google PageSpeed API was unavailable. For accurate Lighthouse scores, ensure internet connectivity or set PAGESPEED_API_KEY.",
-    severity: "info",
-    category: "performance",
-    fix: "Set the PAGESPEED_API_KEY environment variable for precise Lighthouse-based scoring.",
-  });
-
-  performanceResult.issues = generatePerformanceIssues(estimatedScore, performanceResult.issues);
   return performanceResult;
 }
 
@@ -945,19 +1279,37 @@ function calculateContentScore(
 ): number {
   let score = 100;
 
+  // Heading structure
   if (headings.h1Count === 0) score -= 20;
-  if (headings.h1Count > 1) score -= 10;
+  else if (headings.h1Count > 1) score -= 10;
   if (headings.h2Count === 0) score -= 5;
+
+  // Thin content penalty (word count is stored via issues presence)
+  const hasThinContent = headings.issues.some((i) => i.id === "thin-content");
+  if (hasThinContent) score -= 15;
+
+  // H1/title keyword alignment
+  const hasH1TitleMismatch = headings.issues.some((i) => i.id === "h1-title-mismatch");
+  if (hasH1TitleMismatch) score -= 5;
+
+  // Open Graph completeness
   if (!meta.ogTitle) score -= 5;
   if (!meta.ogDescription) score -= 5;
   if (!meta.ogImage) score -= 5;
+
+  // Description quality
+  const descLen = meta.descriptionLength;
+  if (descLen > 0 && descLen < META_TAG_LIMITS.DESCRIPTION_MIN) score -= 5;
+
+  // Images
   if (images.imagesWithoutAlt.length > 0) {
-    score -= Math.min(20, images.imagesWithoutAlt.length * 5);
+    score -= Math.min(15, images.imagesWithoutAlt.length * 5);
   }
   if (images.nonOptimizedImages.length > 0) {
-    score -= Math.min(10, images.nonOptimizedImages.length * 2);
+    score -= Math.min(5, images.nonOptimizedImages.length * 1);
   }
 
+  // Title length
   const titleLen = meta.titleLength;
   if (titleLen > 0 && (titleLen < META_TAG_LIMITS.TITLE_MIN || titleLen > META_TAG_LIMITS.TITLE_MAX)) {
     score -= 5;
