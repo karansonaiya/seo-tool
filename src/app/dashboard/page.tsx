@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
+import { signOut, useSession } from "next-auth/react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -25,6 +26,7 @@ import {
   Settings,
   Users,
   Bell,
+  LogOut,
 } from "lucide-react";
 
 // ===========================================
@@ -56,6 +58,8 @@ const mockScoreHistory = [
 ];
 
 export default function DashboardPage() {
+  const { data: session } = useSession();
+
   return (
     <div className="min-h-screen bg-mesh grid-pattern">
       {/* Sidebar + Content Layout */}
@@ -126,12 +130,30 @@ export default function DashboardPage() {
               </div>
               <div className="flex items-center gap-3">
                 <ThemeToggle />
+                {session?.user?.image && (
+                  <img
+                    src={session.user.image}
+                    alt={session.user.name ?? "User"}
+                    className="w-8 h-8 rounded-full ring-2 ring-white/10"
+                  />
+                )}
+                <span className="hidden sm:block text-sm text-muted-foreground">
+                  {session?.user?.name}
+                </span>
                 <Link href="/audit">
                   <Button size="sm">
                     <Plus className="h-4 w-4" />
                     New Audit
                   </Button>
                 </Link>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => signOut({ callbackUrl: "/login" })}
+                  title="Sign out"
+                >
+                  <LogOut className="h-4 w-4" />
+                </Button>
               </div>
             </div>
           </header>

@@ -10,14 +10,12 @@ interface MongooseCache {
   promise: Promise<typeof mongoose> | null;
 }
 
-/* eslint-disable no-var */
-declare global {
-  var mongooseCache: MongooseCache | undefined;
-}
+// Use globalThis instead of global — works in Node.js, Edge runtime, and browsers
+const g = globalThis as typeof globalThis & { mongooseCache?: MongooseCache };
 
-const cached: MongooseCache = global.mongooseCache || { conn: null, promise: null };
-if (!global.mongooseCache) {
-  global.mongooseCache = cached;
+const cached: MongooseCache = g.mongooseCache ?? { conn: null, promise: null };
+if (!g.mongooseCache) {
+  g.mongooseCache = cached;
 }
 
 export async function connectDB(): Promise<typeof mongoose> {
